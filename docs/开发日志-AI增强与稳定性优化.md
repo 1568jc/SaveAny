@@ -124,5 +124,5 @@ Whisper 识别普通话经常默认输出繁体（训练数据里繁体占比不
 
 1. **抖音 IP 级风控**：公开接口对服务端 IP 敏感（高频请求后短链重定向都会被掐），间歇性失效。本地自用等几小时可恢复；上线需配 Cookie 池或代理池
 2. **时间戳不可跳转**：站内无视频播放器，章节/引用时间戳仅展示
-3. **ASR 回退无进度反馈**：whisper 转写期间前端只有静态"正在提取视频字幕…"提示，长视频体验一般（本地视频有百分比进度，在线回退还没接）
+3. ~~**ASR 回退无进度反馈**~~ ✅ **已解决**：在线 ASR 经 SSE `subtitle_progress` 事件实时推送进度（`download` / `transcribe` 两阶段 + 百分比），前端展示真实进度条。实现在 `api_summarize._asr_events`（`call_soon_threadsafe` + `asyncio.Queue` 桥接工作线程进度）+ `online_asr.transcribe_online_video` 新增 `on_progress` 透传 + `VideoSummary.vue` 进度条
 4. 测试期在本地数据库注册了几个测试账号（`verify*@test.com`），如介意可删 `backend/data/app.db` 重建
