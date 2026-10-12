@@ -79,6 +79,57 @@ def _get_extractor():
     return _get_extractor._instance
 
 
+async def _asr_events(url: str, direct_url: str, out: dict) -> AsyncIterable[ServerSentEvent]:
+    """在线视频语音识别：把转写进度实时推给前端（subtitle_progress 事件）。
+
+    ASR 在工作线程里跑（可能持续几分钟），进度回调经 call_soon_threadsafe
+    桥接进事件循环的消费队列，主协程边收边发 SSE。
+    结果写入 out["data"]，异常写入 out["error"]（async 生成器无法用返回值传数据）。
+    """
+    loop = asyncio.get_event_loop()
+    progress_q = asyncio.Queue()
+
+    last_pct = [-1]
+
+    def on_progress(pct):
+        # 按整百分比去重，最多 100 个事件，不会刷屏
+        if pct != last_pct[0]:
+            last_pct[0] = pct
+            loop.call_soon_threadsafe(progress_q.put_nowait, pct)
+
+    yield ServerSentEvent(
+        raw_data=json.dumps({"stage": "download"}, ensure_ascii=False),
+        event="subtitle_progress",
+    )
+
+    future = loop.run_in_executor(
+        None, lambda: transcribe_online_video(url, direct_url, on_progress=on_progress)
+    )
+    while not (future.done() and progress_q.empty()):
+        try:
+            pct = await asyncio.wait_for(progress_q.get(), timeout=0.3)
+        except asyncio.TimeoutError:
+            continue
+        yield ServerSentEvent(
+            raw_data=json.dumps({"stage": "transcribe", "percent": pct}, ensure_ascii=False),
+            event="subtitle_progress",
+        )
+
+    # future 完成时可能还有已排队未执行的回调，让出一次事件循环再排空队列
+    await asyncio.sleep(0)
+    while not progress_q.empty():
+        pct = progress_q.get_nowait()
+        yield ServerSentEvent(
+            raw_data=json.dumps({"stage": "transcribe", "percent": pct}, ensure_ascii=False),
+            event="subtitle_progress",
+        )
+
+    try:
+        out["data"] = future.result()
+    except Exception as e:
+        out["error"] = e
+
+
 @router.post("/summarize", response_class=EventSourceResponse)
 async def summarize_video(req: SummarizeRequest, user: dict | None = Depends(get_optional_user)) -> AsyncIterable[ServerSentEvent]:
     """
@@ -99,16 +150,24 @@ async def summarize_video(req: SummarizeRequest, user: dict | None = Depends(get
         if is_douyin_url(req.url):
             # 抖音没有平台字幕（yt-dlp 也不支持其用户页），直接走语音识别回退；
             # 优先用前端解析时拿到的直链，避免再次请求抖音 API
-            subtitle_data = await loop.run_in_executor(
-                None, lambda: transcribe_online_video(req.url, req.direct_url)
-            )
+            asr_out: dict = {}
+            async for event in _asr_events(req.url, req.direct_url, asr_out):
+                yield event
+            if "error" in asr_out:
+                raise asr_out["error"]
+            subtitle_data = asr_out["data"]
         else:
             subtitle_data = await loop.run_in_executor(
                 None, extractor.extract, req.url
             )
             if not subtitle_data["has_subtitle"]:
                 # 平台没有字幕轨道时，下载音频用 whisper 转写兜底
-                subtitle_data = await loop.run_in_executor(None, transcribe_online_video, req.url)
+                asr_out = {}
+                async for event in _asr_events(req.url, "", asr_out):
+                    yield event
+                if "error" in asr_out:
+                    raise asr_out["error"]
+                subtitle_data = asr_out["data"]
 
         yield ServerSentEvent(
             raw_data=json.dumps(subtitle_data, ensure_ascii=False),

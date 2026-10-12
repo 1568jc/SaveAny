@@ -25,11 +25,12 @@ class OnlineASRError(Exception):
     """在线视频语音识别失败"""
 
 
-def transcribe_online_video(url: str, direct_url: str = "") -> dict:
+def transcribe_online_video(url: str, direct_url: str = "", on_progress=None) -> dict:
     """对在线视频做语音识别，返回与 SubtitleExtractor.extract() 一致的结构。
 
     流程：下载音频/视频（校验时长）→ whisper 转写 → 清理临时文件。
-    失败抛出 OnlineASRError。
+    on_progress：可选的转写进度回调（0-100 整数），透传给 local_video.transcribe；
+    不传时行为与之前完全一致。失败抛出 OnlineASRError。
     """
     with tempfile.TemporaryDirectory() as tmp_dir:
         try:
@@ -43,7 +44,7 @@ def transcribe_online_video(url: str, direct_url: str = "") -> dict:
             raise OnlineASRError(f"音频获取失败: {e}")
 
         try:
-            return local_video.transcribe(audio_path, duration)
+            return local_video.transcribe(audio_path, duration, on_progress=on_progress)
         except Exception as e:
             raise OnlineASRError(str(e))
 

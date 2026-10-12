@@ -28,6 +28,15 @@
           <div v-if="loading && !summaryText && activeTab === 'summary'" class="flex flex-col items-center justify-center py-16">
             <div class="w-12 h-12 border-4 border-primary/20 border-t-primary rounded-full animate-spin mb-4"></div>
             <p class="text-text-secondary text-sm">{{ loadingMessage }}</p>
+            <!-- 在线视频走语音识别兜底时展示真实进度 -->
+            <div v-if="asrProgress != null" class="w-48 mt-4">
+              <div class="h-1.5 w-full rounded-full bg-gray-100 overflow-hidden">
+                <div
+                  class="h-full rounded-full bg-primary transition-all duration-300"
+                  :style="{ width: asrProgress + '%' }"
+                ></div>
+              </div>
+            </div>
           </div>
 
           <!-- 总结摘要 Tab -->
@@ -145,7 +154,7 @@
             </div>
             <div v-else class="flex flex-col items-center justify-center py-16">
               <div class="w-10 h-10 border-4 border-primary/20 border-t-primary rounded-full animate-spin mb-3"></div>
-              <p class="text-text-muted text-sm">正在提取字幕...</p>
+              <p class="text-text-muted text-sm">{{ loadingMessage }}</p>
             </div>
           </div>
 
@@ -326,6 +335,8 @@ const tabs = [
 const activeTab = ref('summary')
 const loading = ref(false)
 const loadingMessage = ref('正在提取视频字幕...')
+// 在线视频走语音识别兜底时的真实进度（0-100）；未走 ASR 时恒为 null，界面无变化
+const asrProgress = ref(null)
 
 const summaryText = ref('')
 const subtitleData = ref({ segments: [], has_subtitle: false })
@@ -728,12 +739,26 @@ async function startSummarize() {
   summaryText.value = ''
   mindmapMarkdown.value = ''
   quotaInfo.value = null
+  asrProgress.value = null
   loadingMessage.value = '正在提取视频字幕...'
 
   // 本地视频与在线视频的 SSE 事件完全一致，只是入口不同，回调逻辑共用一份
   const callbacks = {
+      subtitle_progress: (data) => {
+        // 在线视频无平台字幕、走语音识别兜底时的实时进度
+        try {
+          const p = JSON.parse(data)
+          if (p.stage === 'download') {
+            loadingMessage.value = '正在下载视频音频...'
+          } else if (p.stage === 'transcribe') {
+            asrProgress.value = p.percent
+            loadingMessage.value = `无平台字幕，正在语音识别生成字幕... ${p.percent}%`
+          }
+        } catch (e) { /* ignore parse error */ }
+      },
       subtitle: (data) => {
         try {
+          asrProgress.value = null
           subtitleData.value = JSON.parse(data)
           if (subtitleData.value.has_subtitle) {
             loadingMessage.value = 'AI 正在分析视频内容...'
@@ -756,10 +781,12 @@ async function startSummarize() {
       },
       done: () => {
         loading.value = false
+        asrProgress.value = null
         emitResult()
       },
       error: (data) => {
         loading.value = false
+        asrProgress.value = null
         try {
           const parsed = JSON.parse(data)
           if (parsed.need_login) {
