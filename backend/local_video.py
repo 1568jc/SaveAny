@@ -80,6 +80,10 @@ WHISPER_LANGUAGE = os.getenv("WHISPER_LANGUAGE", "") or None  # 空表示自动�
 # 处理串行化：语音识别是 CPU 密集型，同时跑多个会互相拖慢
 _executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="local-video")
 
+# 排队预估：本机 CPU(base/int8) 实测 60 分钟视频约 25 分钟转写完成，
+# 即转写耗时 ≈ 时长 × 0.42；默认 0.5 留少量余量覆盖探测与抽音轨
+QUEUE_ETA_FACTOR = float(os.getenv("QUEUE_ETA_FACTOR", "0.5"))
+
 # 单个用户同时进行中的任务数上限：处理是串行的，
 # 不限制的话一个账号连续提交就能把队列占满，别人一直排不上。
 MAX_ACTIVE_JOBS_PER_USER = 1
@@ -218,6 +222,8 @@ def create_job(user_id: int, filename: str, filesize: int, is_admin: bool = Fals
             "subtitle": None,             # 与 SubtitleExtractor.extract() 同构
             "video_path": None,
             "audio_path": None,
+            "submitted_at": None,         # 提交线程池的时间（排队顺序以它为准）
+            "transcribe_pct": 0,          # 转写进度 0-100（用于排队 ETA 折算）
             "created_at": time.time(),
             "updated_at": time.time(),
         }
@@ -240,6 +246,40 @@ def count_active_jobs(user_id: int) -> int:
             1 for j in _jobs.values()
             if j["user_id"] == user_id and j["status"] in ACTIVE_STATUSES
         )
+
+
+def _estimate_job_seconds(job: dict) -> float:
+    """粗略估算一个任务的剩余处理耗时（秒），只用于排队提示，不求精确"""
+    duration = job.get("duration") or 0
+    if duration <= 0:
+        # 还没 ffprobe 探测出时长，用文件大小按常见 2Mbps 码率粗估
+        duration = (job.get("filesize") or 0) * 8 / 2_000_000
+    total = duration * QUEUE_ETA_FACTOR + 20  # 20s 覆盖探测与抽音轨
+    if job["status"] == "transcribing":
+        pct = job.get("transcribe_pct") or 0
+        return max(5.0, total * (1 - pct / 100))
+    return total
+
+
+def queue_info(job: dict) -> dict:
+    """排队位置与预计等待秒数，仅对 pending（排队中）的任务有意义。
+
+    处理是串行的：排在前面的 = 正在处理的 + 更早提交且仍在排队的任务，
+    预计等待即它们的剩余耗时之和。排序用 submitted_at 而非 created_at——
+    大文件上传慢，任务创建早但提交晚，created_at 顺序不是真实排队顺序。
+    """
+    if job["status"] != "pending":
+        return {"queue_position": 0, "eta_seconds": None}
+    my_order = job.get("submitted_at") or job["created_at"]
+    with _jobs_lock:
+        ahead = [
+            j for j in _jobs.values()
+            if j["job_id"] != job["job_id"]
+            and j["status"] in ACTIVE_STATUSES
+            and (j.get("submitted_at") or j["created_at"]) < my_order
+        ]
+    eta = sum(_estimate_job_seconds(j) for j in ahead)
+    return {"queue_position": len(ahead), "eta_seconds": int(eta)}
 
 
 def get_job(job_id: str, user_id: int) -> Optional[dict]:
@@ -265,6 +305,7 @@ def job_status_payload(job: dict) -> dict:
         "duration": job["duration"],
         "duration_string": job["duration_string"],
         "segment_count": len(subtitle["segments"]) if subtitle else 0,
+        **queue_info(job),
     }
 
 
@@ -561,6 +602,7 @@ def transcribe(audio_path: str, total_duration: float, on_progress=None) -> dict
 
 def submit_processing(job_id: str):
     """把任务丢进串行线程池"""
+    _update_job(job_id, submitted_at=time.time())
     _executor.submit(_process_job, job_id)
 
 
@@ -638,6 +680,7 @@ def _process_job(job_id: str):
                 job_id,
                 progress=max(20, min(99, 20 + int(pct * 0.79))),
                 stage_text=f"正在识别语音，生成字幕... {pct}%",
+                transcribe_pct=pct,
             )
 
         subtitle = transcribe(audio_path, duration, on_progress=on_progress)

@@ -141,7 +141,7 @@
         <p class="text-xs text-text-muted mt-2.5">
           {{ phase === 'uploading'
             ? '正在上传，请勿关闭页面'
-            : '语音识别较耗时，长视频请耐心等待' }}
+            : (queueHint || '语音识别较耗时，长视频请耐心等待') }}
         </p>
       </div>
     </div>
@@ -222,6 +222,15 @@ const stageText = computed(() => {
 const displayPercent = computed(() => {
   if (phase.value === 'uploading') return uploadPercent.value
   return status.value?.progress ?? 0
+})
+
+// 排队提示：只在前面真有其他任务时出现；单人使用时界面与之前完全一致
+const queueHint = computed(() => {
+  const s = status.value
+  if (phase.value !== 'processing' || !s || !s.queue_position) return ''
+  if (s.eta_seconds == null) return `排队中：前面还有 ${s.queue_position} 个任务`
+  const min = Math.max(1, Math.ceil(s.eta_seconds / 60))
+  return `排队中：前面还有 ${s.queue_position} 个任务，预计等待约 ${min} 分钟`
 })
 
 async function loadConfig() {
